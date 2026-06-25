@@ -1,9 +1,11 @@
 [project]
 name = "memory-sweeper"
 version = "0.1.0"
-description = "Automated leak detection and refactor suggestions for Python code."
-authors = [{name = "Axentx"}]
-requires-python = ">=3.8"
+description = "Utility to map memory leaks to cloud cost impact."
+authors = [{name = "AxentX"}]
+requires-python = ">=3.9"
+license = {text = "MIT"}
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

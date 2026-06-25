@@ -1,14 +1,13 @@
-# memory-sweeper
+# Memory Sweeper – Cloud Cost Impact Dashboard (Prototype)
 
-`memory-sweeper` is a tiny static analysis tool that scans a piece of Python source code
-and reports possible resource leaks (e.g., files opened without being closed).  
-For each detected leak it provides:
+This tiny Python library demonstrates the core logic behind the **Memory‑Sweeper** product:
 
-* **Severity** – `high` for unclosed files, `medium` for other resources (e.g., sockets).  
-* **Message** – a short description of the problem.  
-* **Suggestion** – a concrete code snippet or refactor step to fix the issue.
+* **Ingest** CSV cost metrics (e.g., AWS EC2 memory‑GB‑hour).
+* **Compute** daily memory usage deltas from snapshots.
+* **Estimate** incremental cost caused by a memory increase.
+* **Generate** a 30‑day time‑series that flags possible leaks.
+* **Export** the result as CSV for downstream UI consumption.
 
-The implementation lives in `src/memory_sweeper.py` and is completely based on the
-standard library (`ast`, `dataclasses`, …).  
+The implementation uses only the Python standard library and is fully covered by unit tests.
 
-Run the test suite with:
+## Quick start

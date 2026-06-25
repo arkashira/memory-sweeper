@@ -1,160 +1,154 @@
-"""memory_sweeper – simple static analysis for resource leaks."""
-
-from __future__ import annotations
-
-import ast
+import csv
+import datetime
 from dataclasses import dataclass
-from typing import List, Set, Tuple, Optional
+from typing import List, Tuple, Dict, Iterable
 
 
 @dataclass(frozen=True)
-class LeakReport:
-    """A single leak detection report."""
-    line: int
-    severity: str  # "low", "medium", "high"
-    message: str
-    suggestion: str
+class CostMetric:
+    """Cost metric for a given day and service."""
+    date: datetime.date
+    service: str
+    memory_gb_hour: float
+    cost_usd: float
 
 
-class _LeakVisitor(ast.NodeVisitor):
-    """AST visitor that collects open/socket calls and close calls."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        # (node, var_name, line)
-        self.open_calls: List[Tuple[ast.Call, Optional[str], int]] = []
-        # (node, var_name, line)
-        self.socket_calls: List[Tuple[ast.Call, Optional[str], int]] = []
-        # set of variable names that have a .close() call
-        self.closed_vars: Set[str] = set()
-        # set of (line) that are safe because they appear in a with statement
-        self.with_safe_lines: Set[int] = set()
-
-    def visit_With(self, node: ast.With) -> None:
-        """Mark any resource opened inside a with‑statement as safe."""
-        for item in node.items:
-            expr = item.context_expr
-            if isinstance(expr, ast.Call):
-                func = expr.func
-                if isinstance(func, ast.Name) and func.id == "open":
-                    self.with_safe_lines.add(expr.lineno)
-                elif (
-                    isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "socket"
-                    and func.attr == "socket"
-                ):
-                    self.with_safe_lines.add(expr.lineno)
-        self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        """Capture assignments of open()/socket() to a variable."""
-        if isinstance(node.value, ast.Call):
-            func = node.value.func
-            var_name = None
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                var_name = node.targets[0].id
-            if isinstance(func, ast.Name) and func.id == "open":
-                self.open_calls.append((node.value, var_name, node.lineno))
-            elif (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "socket"
-                and func.attr == "socket"
-            ):
-                self.socket_calls.append((node.value, var_name, node.lineno))
-        self.generic_visit(node)
-
-    def visit_Expr(self, node: ast.Expr) -> None:
-        """Capture calls like open() used directly (no assignment)."""
-        if isinstance(node.value, ast.Call):
-            func = node.value.func
-            if isinstance(func, ast.Name) and func.id == "open":
-                self.open_calls.append((node.value, None, node.lineno))
-            elif (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "socket"
-                and func.attr == "socket"
-            ):
-                self.socket_calls.append((node.value, None, node.lineno))
-        self.generic_visit(node)
-
-    def visit_Call(self, node: ast.Call) -> None:
-        """Capture .close() calls on variables."""
-        if isinstance(node.func, ast.Attribute):
-            if node.func.attr == "close" and isinstance(node.func.value, ast.Name):
-                self.closed_vars.add(node.func.value.id)
-        self.generic_visit(node)
+@dataclass(frozen=True)
+class MemorySnapshot:
+    """Memory usage snapshot for a given day."""
+    date: datetime.date
+    memory_gb: float
 
 
-def _is_safe(call_line: int, safe_lines: Set[int]) -> bool:
-    """Return True if the call appears inside a with‑statement."""
-    return call_line in safe_lines
-
-
-def detect_leaks(source: str) -> List[LeakReport]:
+def parse_cost_metrics(csv_text: str) -> List[CostMetric]:
     """
-    Detect resource leaks in the given Python source code.
+    Parse CSV text containing cost metrics.
 
-    Currently supports:
-    * ``open`` – file handles (severity: high)
-    * ``socket.socket`` – sockets (severity: medium)
-
-    A resource is considered safe when:
-    * It is used inside a ``with`` statement, or
-    * The variable it was assigned to is later closed via ``.close()``.
+    Expected header: date,service,memory_gb_hour,cost_usd
+    Date format: YYYY-MM-DD
     """
-    tree = ast.parse(source)
-    visitor = _LeakVisitor()
-    visitor.visit(tree)
+    reader = csv.DictReader(csv_text.strip().splitlines())
+    metrics: List[CostMetric] = []
+    for row in reader:
+        try:
+            date = datetime.datetime.strptime(row["date"], "%Y-%m-%d").date()
+            service = row["service"]
+            memory_gb_hour = float(row["memory_gb_hour"])
+            cost_usd = float(row["cost_usd"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid row in cost metrics CSV: {row}") from exc
+        metrics.append(CostMetric(date, service, memory_gb_hour, cost_usd))
+    return metrics
 
-    reports: List[LeakReport] = []
 
-    # Helper to create a report
-    def make_report(line: int, severity: str, message: str, suggestion: str) -> LeakReport:
-        return LeakReport(line=line, severity=severity, message=message, suggestion=suggestion)
+def compute_memory_increase(
+    snapshots: List[MemorySnapshot],
+) -> List[Tuple[datetime.date, float]]:
+    """
+    Compute daily memory increase (delta) compared to the previous day.
 
-    # Process open() calls
-    for call, var_name, line in visitor.open_calls:
-        if _is_safe(line, visitor.with_safe_lines):
-            continue
-        if var_name and var_name in visitor.closed_vars:
-            continue
-        suggestion = (
-            "Wrap the file operation in a with‑statement:\n"
-            "with open('path') as f:\n"
-            "    # use f here"
-        )
-        reports.append(
-            make_report(
-                line=line,
-                severity="high",
-                message="File opened without guaranteed close.",
-                suggestion=suggestion,
-            )
-        )
+    Returns a list of (date, delta_gb). The first day delta is 0.
+    """
+    if not snapshots:
+        return []
 
-    # Process socket.socket() calls
-    for call, var_name, line in visitor.socket_calls:
-        if _is_safe(line, visitor.with_safe_lines):
-            continue
-        if var_name and var_name in visitor.closed_vars:
-            continue
-        suggestion = (
-            "Use a context manager or ensure the socket is closed:\n"
-            "with socket.socket() as s:\n"
-            "    # use s here"
-        )
-        reports.append(
-            make_report(
-                line=line,
-                severity="medium",
-                message="Socket created without guaranteed close.",
-                suggestion=suggestion,
-            )
-        )
+    # Ensure snapshots are sorted by date
+    snapshots = sorted(snapshots, key=lambda s: s.date)
+    result: List[Tuple[datetime.date, float]] = []
+    previous = snapshots[0].memory_gb
+    result.append((snapshots[0].date, 0.0))
 
-    # Sort by line number for deterministic output
-    reports.sort(key=lambda r: r.line)
-    return reports
+    for snap in snapshots[1:]:
+        delta = snap.memory_gb - previous
+        result.append((snap.date, delta))
+        previous = snap.memory_gb
+    return result
+
+
+def estimate_incremental_cost(
+    increments: List[Tuple[datetime.date, float]],
+    cost_per_gb_hour: float,
+) -> List[Tuple[datetime.date, float]]:
+    """
+    Convert memory increments into incremental cost.
+
+    cost_per_gb_hour is the USD cost for one GB of memory per hour.
+    The function assumes a 24‑hour day for each increment.
+    """
+    result: List[Tuple[datetime.date, float]] = []
+    for date, delta_gb in increments:
+        incremental_cost = max(delta_gb, 0.0) * 24.0 * cost_per_gb_hour
+        result.append((date, incremental_cost))
+    return result
+
+
+def generate_time_series(
+    cost_metrics: List[CostMetric],
+    memory_increments: List[Tuple[datetime.date, float]],
+    leak_threshold_gb: float = 0.5,
+) -> List[Tuple[datetime.date, float, float, bool]]:
+    """
+    Produce a time‑series for the last 30 days.
+
+    Each entry is (date, total_cost_usd, incremental_cost_usd, is_leak).
+    - total_cost_usd: sum of cost_usd for that date across services.
+    - incremental_cost_usd: cost derived from memory increase.
+    - is_leak: True if the memory delta exceeds leak_threshold_gb.
+    """
+    # Build lookup tables
+    cost_by_date: Dict[datetime.date, float] = {}
+    for metric in cost_metrics:
+        cost_by_date.setdefault(metric.date, 0.0)
+        cost_by_date[metric.date] += metric.cost_usd
+
+    inc_by_date: Dict[datetime.date, Tuple[float, bool]] = {}
+    for date, delta in memory_increments:
+        inc_by_date[date] = (delta, delta > leak_threshold_gb)
+
+    # Determine the date range (last 30 days from the latest metric)
+    if cost_metrics:
+        latest = max(metric.date for metric in cost_metrics)
+    elif memory_increments:
+        latest = max(date for date, _ in memory_increments)
+    else:
+        return []
+
+    start = latest - datetime.timedelta(days=29)
+    series: List[Tuple[datetime.date, float, float, bool]] = []
+    for i in range(30):
+        day = start + datetime.timedelta(days=i)
+        total_cost = cost_by_date.get(day, 0.0)
+        delta, is_leak = inc_by_date.get(day, (0.0, False))
+        incremental_cost = max(delta, 0.0) * 24.0 * _average_cost_per_gb_hour(cost_metrics)
+        series.append((day, total_cost, incremental_cost, is_leak))
+    return series
+
+
+def _average_cost_per_gb_hour(cost_metrics: Iterable[CostMetric]) -> float:
+    """
+    Helper to compute average cost per GB‑hour from provided metrics.
+    Returns 0.0 if no data is available.
+    """
+    total_cost = 0.0
+    total_gb_hour = 0.0
+    for metric in cost_metrics:
+        total_cost += metric.cost_usd
+        total_gb_hour += metric.memory_gb_hour
+    if total_gb_hour == 0.0:
+        return 0.0
+    return total_cost / total_gb_hour
+
+
+def export_to_csv(
+    series: List[Tuple[datetime.date, float, float, bool]]
+) -> str:
+    """
+    Export the time‑series to a CSV string.
+
+    Columns: date,total_cost_usd,incremental_cost_usd,is_leak
+    """
+    output = ["date,total_cost_usd,incremental_cost_usd,is_leak"]
+    for date, total, inc, leak in series:
+        line = f"{date.isoformat()},{total:.2f},{inc:.2f},{leak}"
+        output.append(line)
+    return "\n".join(output)
